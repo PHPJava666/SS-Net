@@ -72,7 +72,7 @@ if __name__ == "__main__":
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
     logging.info(str(args))
 
-    model = net_factory(net_type=args.model, in_chns=1, class_num=num_classes, mode="train")
+    model = net_factory(net_type=args.model, in_chns=1, class_num=num_classes, mode="train")#model是VNet
     prototype_memory = feature_memory.FeatureMemory(elements_per_class=32, n_classes=num_classes)
     db_train = LAHeart(base_dir=train_data_path,
                        split='train',
@@ -84,13 +84,13 @@ if __name__ == "__main__":
     labelnum = args.labelnum
     labeled_idxs = list(range(labelnum))
     unlabeled_idxs = list(range(labelnum, args.max_samples))
-    batch_sampler = TwoStreamBatchSampler(labeled_idxs, unlabeled_idxs, args.batch_size, args.batch_size-args.labeled_bs)
+    batch_sampler = TwoStreamBatchSampler(labeled_idxs, unlabeled_idxs, args.batch_size, args.batch_size-args.labeled_bs)#两路采样器，一路是有标签的样本，一路是无标签的样本，分的很清楚
     def worker_init_fn(worker_id):
         random.seed(args.seed+worker_id)
     trainloader = DataLoader(db_train, batch_sampler=batch_sampler, num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn)
 
     dice_loss = losses.Binary_dice_loss
-    adv_loss=losses.VAT3d(epi=args.magnitude)
+    adv_loss=losses.VAT3d(epi=args.magnitude)#ssnet特有
     optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
     
     writer = SummaryWriter(snapshot_path+'/log')
@@ -102,46 +102,60 @@ if __name__ == "__main__":
     iterator = tqdm(range(max_epoch), ncols=70)
     for epoch_num in iterator:
         for _, sampled_batch in enumerate(trainloader):
-            volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
+            volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']#volume_batch和label_batch数量一致
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
-            model.train()
-            outputs, embedding = model(volume_batch)
-            outputs_soft = F.softmax(outputs, dim=1)
-            labeled_features = embedding[:args.labeled_bs,...]
-            unlabeled_features = embedding[args.labeled_bs:,...]
-            y = outputs_soft[:args.labeled_bs]
-            true_labels = label_batch[:args.labeled_bs]
+            model.train()#使用VNet进行分割
+            outputs, embedding = model(volume_batch)#outputs是分割结果，即模型对每个输入图像的预测结果，embedding是特征，即模型的内部表示，通常用于进一步的处理或分析。这里是把一个batch_size里面的都分割了
+            outputs_soft = F.softmax(outputs, dim=1)#对输出的output进行softmax处理，dim=1表示对每一行进行softmax处理
+            labeled_features = embedding[:args.labeled_bs,...]#这两行代码将嵌入embedding分成两部分：label_features是有标签的样本的特征
+            unlabeled_features = embedding[args.labeled_bs:,...]#unlabeled_features是无标签的样本的特征
+            y = outputs_soft[:args.labeled_bs]#y是有标签的样本的预测结果
+            true_labels = label_batch[:args.labeled_bs]#true_labels是有标签的样本的真实标签
+
+            #labeled_bs， default=2, help='batch_size of labeled data per gpu')
+            #batch_size， default=4, help='batch_size per gpu')每个batch有4个样本，其中有2个有标签，2个无标签
             
-            _, prediction_label = torch.max(y, dim=1)
+            _, prediction_label = torch.max(y, dim=1)#获取模型对有标签样本的预测结果，y是模型输出，是一个概率分布。torch.max(y, dim=1)返回y中每一行的最大值和最大值的索引，即预测的标签,这里只取了索引，即预测的标签
             _, pseudo_label = torch.max(outputs_soft[args.labeled_bs:], dim=1)  # Get pseudolabels
+            #这行代码是获取模型对无标签样本的预测结果，即伪标签。
             
             mask_prediction_correctly = ((prediction_label == true_labels).float() * (prediction_label > 0).float()).bool()
 	        ### select the correct predictions and ignore the background class
+            #这行代码是在创建一个掩码，用于标记预测正确的样本。这里首先比较预测的标签prediction_label和真实标签true_labels，相等的地方会得到True，不等的地方会得到False。然后，检查预测的标签是否大于0，因为在这个上下文中，0可能被用作背景类或无效类。最后，将结果转换为布尔类型，得到的mask_prediction_correctly可以用于后续的计算，例如计算预测的准确率。
 
-            # Apply the filter mask to the features and its labels
-            labeled_features = labeled_features.permute(0, 2, 3, 4, 1)
-            labels_correct = true_labels[mask_prediction_correctly]
-            labeled_features_correct = labeled_features[mask_prediction_correctly, ...]
+            # Apply the filter mask to the features and its labels这段代码用于处理模型的特征输出，并从中选择预测正确的样本。
+            labeled_features = labeled_features.permute(0, 2, 3, 4, 1)#这里首先将特征张量labeled_features和标签张量true_labels的维度进行转换，以便与掩码mask_prediction_correctly进行匹配。
+            labels_correct = true_labels[mask_prediction_correctly]#然后，使用掩码mask_prediction_correctly选择预测正确的样本。
+            labeled_features_correct = labeled_features[mask_prediction_correctly, ...]#最后，将选择的特征和标签存储在labeled_features_correct和labels_correct中。
 
-            # get projected features
-            with torch.no_grad():
-                model.eval()
-                proj_labeled_features_correct = model.projection_head(labeled_features_correct)
-                model.train()
+            # get projected features这段代码主要用于在模型的评估模式下，对预测正确的样本的特征进行投影，并在完成后将模型切换回训练模式。
+            with torch.no_grad():#这行代码是是在创建一个不需要计算梯度的上下文。在这个上下文中，多以后的计算都不会跟踪梯度，这可以减少内存的使用，并加速计算。这在评估模型或者进行推力时是非常有用的，因为在这些情况下通常是不需要计算梯度的。
+                model.eval()#这里是为了防止在更新内存时，使用的特征是更新后的特征，而不是更新前的特征。因此，这里将模型设置为评估模式，以便在更新内存时，使用的特征是更新前的特征。
+                #这行代码是将模型设置为评估模式。在pytorch中，模型有两种模式：训练模式和评估模式。在评估模式下，模型的某些层（如Dropout或BatchNorm）会以不同的方式工作，以适应模型的评估。
+                proj_labeled_features_correct = model.projection_head(labeled_features_correct)#这里是将选择的特征labeled_features_correct通过模型的投影头projection_head，得到投影后的特征proj_labeled_features_correct。
+                #这行代码是对预测正确的样本的特征label_features_correct进行投影.这里的model.projection_head是模型的投影头，用于将特征映射到一个更高维度的空间。这里的proj_labeled_features_correct是投影后的特征。
+                model.train()#这里将模型设置为训练模式，以便在训练时，使用的特征是更新后的特征。
 
-            # updated memory bank
-            prototype_memory.add_features_from_sample_learned(model, proj_labeled_features_correct, labels_correct)
+            # updated memory bank 这段代码主要用于更新原型记忆库，并对特征和标签进行重塑
+            prototype_memory.add_features_from_sample_learned(model, proj_labeled_features_correct, labels_correct)#这段代码时调用prototype_memory的add_features_from_sample_learned方法，将预测正确的样本的投影特征proj_labeled_features_correct和对应的标签labels_correct添加到原型记忆库中。在这个上下文中，pro_memory可能是一个用于存储每个类别的原型特征的数据结构，add_features_from_sample_learned方法用于更新这些原型特征。
+            labeled_features_all = labeled_features.reshape(-1, labeled_features.size()[-1])#这行代码是将特征张量labeled_features的维度进行重塑，以便与标签张量true_labels进行匹配。
+            #这行代码是在将label_features重塑为二维张量。
+            labeled_labels = true_labels.reshape(-1)#这行代码是在将true_labels重塑为一维张量。reshape(-1)会将true_labels的形状改变为（-1，）,也就是一个一维张量。这样，label_labels就会是一个长度为num_sample的一维张量，其中每个元素对应一个样本的标签。
 
-            labeled_features_all = labeled_features.reshape(-1, labeled_features.size()[-1])
-            labeled_labels = true_labels.reshape(-1)
-
-            # get predicted features
-            proj_labeled_features_all = model.projection_head(labeled_features_all)
-            pred_labeled_features_all = model.prediction_head(proj_labeled_features_all)
+            # get predicted features这段代码主要用于对所有标签样本的特征进行投影和预测。
+            proj_labeled_features_all = model.projection_head(labeled_features_all)#这行代码是将所有标签样本的特征labeled_features_all通过模型的投影头projection_head，得到投影后的特征proj_labeled_features_all。
+            #这行代码是在对所有标签样本的特征label_features_all进行投影。这里的model.projection_head可能是一个神经网络，用于将特征投射到一个新的特征空间。这在一些算法中是常见的操作，例如在对比学习中，通常会有一个投影头用于将特征投影到一个新的特征空间，以便进行对比。
+            pred_labeled_features_all = model.prediction_head(proj_labeled_features_all)#这行代码是将投影后的特征proj_labeled_features_all通过模型的预测头prediction_head，得到预测后的特征pred_labeled_features_all。
+            #这行代码是对投影后的特征proj_labeled_features_all进行预测。这里的model.prediction_head可能是另一个神经网络，用于对投影后的特征进行预测，得到预测结果pred_labeled_features_all。这个预测结果可能会用于计算损失，以便在反向传播过程中更新模型的参数。
 
             # Apply contrastive learning loss
-            loss_contr_labeled = contrastive_losses.contrastive_class_to_class_learned_memory(model, pred_labeled_features_all, labeled_labels, num_classes, prototype_memory.memory)
+            loss_contr_labeled = contrastive_losses.contrastive_class_to_class_learned_memory(model, pred_labeled_features_all, labeled_labels, num_classes, prototype_memory.memory)#这行代码是在计算对比损失。对比损失是一种常用于自监督学习和半监督学习的损失函数，它鼓励模型将相同类别的样本映射到接近的特征向量，将不同类别的样本映射到远离的特征向量。
+            #这里的consistency_losses.contrastive_class_to_class_learned_memory函数接收五个参数：模型model,预测的特征pred_labeled_features_all, 对应的标签label_labels,类别数量num_classes和原型记忆库prototype_memory.memory。            
+            """
+            来自SemiSeg-Contrastive的对比损失函数
+            More details can be checked at https://github.com/Shathe/SemiSeg-Contrastive
+            """
 
 
             unlabeled_features = unlabeled_features.permute(0, 2, 3, 4, 1).reshape(-1, labeled_features.size()[-1])
